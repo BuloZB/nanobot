@@ -16,6 +16,8 @@ Notes:
 - Attachment structures differ across botpy versions; we try multiple field candidates.
 """
 
+# pyright: reportConstantRedefinition=false, reportMissingTypeStubs=false, reportPrivateUsage=false
+
 from __future__ import annotations
 
 import asyncio
@@ -27,7 +29,7 @@ import time
 from collections import deque
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, BinaryIO, Literal, cast
 from urllib.parse import unquote, urlparse
 
 import aiohttp
@@ -48,18 +50,15 @@ except Exception:  # pragma: no cover
 
 try:
     import botpy
+    from botpy.gateway import BotWebSocket
     from botpy.http import Route
 
     QQ_AVAILABLE = True
 except ImportError:  # pragma: no cover
     QQ_AVAILABLE = False
     botpy = None
+    BotWebSocket = None
     Route = None
-
-if TYPE_CHECKING:
-    from botpy.message import BaseMessage, C2CMessage, GroupMessage
-    from botpy.types.message import Media
-
 
 # QQ rich media file_type: 1=image, 4=file
 # (2=voice, 3=video are restricted; we only use image vs file)
@@ -104,26 +103,74 @@ def _guess_send_file_type(filename: str) -> int:
     return QQ_FILE_TYPE_FILE
 
 
-def _make_bot_class(channel: QQChannel) -> type[botpy.Client]:
-    """Create a botpy Client subclass bound to the given channel."""
-    intents = botpy.Intents(public_messages=True, direct_message=True)
+_RECONNECT_BACKOFF_START = 5
+_RECONNECT_BACKOFF_MAX = 300
 
-    class _Bot(botpy.Client):
+
+def _is_network_error(exc: BaseException) -> bool:
+    """Check whether an exception is a transient network/DNS error."""
+    return isinstance(
+        exc,
+        (aiohttp.ClientConnectorError, OSError),
+    )
+
+
+def _make_bot_class(channel: QQChannel) -> type[Any]:
+    """Create a botpy client with per-session reconnect backoff."""
+    botpy_sdk = cast(Any, botpy)
+    intents = botpy_sdk.Intents(public_messages=True, direct_message=True)
+
+    class _Bot(botpy_sdk.Client):
         def __init__(self):
             # Disable botpy's file log — nanobot uses loguru; default "botpy.log" fails on read-only fs
-            super().__init__(intents=intents, ext_handlers=False)
+            super().__init__(  # pyright: ignore[reportUnknownMemberType]
+                intents=intents,
+                ext_handlers=False,
+            )
+            self._ws_backoff: dict[int, int] = {}
+            self._ws_retry_at: dict[int, float] = {}
 
         async def on_ready(self):
             logger.info("QQ bot ready: {}", self.robot.name)
 
-        async def on_c2c_message_create(self, message: C2CMessage):
+        async def on_c2c_message_create(self, message: object) -> None:
             await channel._on_message(message, is_group=False)
 
-        async def on_group_at_message_create(self, message: GroupMessage):
+        async def on_group_at_message_create(self, message: object) -> None:
             await channel._on_message(message, is_group=True)
 
-        async def on_direct_message_create(self, message):
+        async def on_direct_message_create(self, message: object) -> None:
             await channel._on_message(message, is_group=False)
+
+        async def bot_connect(self, session: object) -> None:
+            """Connect a botpy session with exponential retry backoff."""
+            session_id = id(session)
+            retry_at = self._ws_retry_at.pop(session_id, None)
+            if retry_at is not None:
+                remaining = retry_at - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+
+            websocket_class = cast(Any, BotWebSocket)
+            client = websocket_class(session, self._connection)
+            backoff = self._ws_backoff.get(session_id, _RECONNECT_BACKOFF_START)
+            try:
+                await client.ws_connect()
+                self._ws_backoff.pop(session_id, None)
+            except (Exception, KeyboardInterrupt, SystemExit) as e:
+                if _is_network_error(e):
+                    channel.logger.warning(
+                        "QQ bot network error (retry in {}s): {}",
+                        backoff,
+                        e,
+                    )
+                    # Count botpy's post-connect pacing toward the retry delay.
+                    self._ws_retry_at[session_id] = time.monotonic() + backoff
+                    self._ws_backoff[session_id] = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
+                else:
+                    channel.logger.exception("QQ bot WebSocket error: {}", e)
+
+                self._connection.add(session)
 
     return _Bot
 
@@ -162,7 +209,7 @@ class QQChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: QQConfig = config
 
-        self._client: botpy.Client | None = None
+        self._client: Any | None = None
         self._http: aiohttp.ClientSession | None = None
 
         self._processed_ids: deque[str] = deque(maxlen=1000)
@@ -210,15 +257,25 @@ class QQChannel(BaseChannel):
         await self._run_bot()
 
     async def _run_bot(self) -> None:
-        """Run the bot connection with auto-reconnect."""
+        """Run botpy with fallback backoff for errors escaping start()."""
+        backoff = 5
+        max_backoff = 300
         while self._running:
             try:
-                await self._client.start(appid=self.config.app_id, secret=self.config.secret)
+                client = cast(Any, self._client)
+                await client.start(appid=self.config.app_id, secret=self.config.secret)
+                backoff = 5
             except Exception as e:
-                self.logger.warning("bot error: {}", e)
+                if _is_network_error(e):
+                    self.logger.warning(
+                        "QQ bot network error (retry in {}s): {}", backoff, e
+                    )
+                else:
+                    self.logger.warning("bot error: {}", e)
             if self._running:
-                self.logger.info("Reconnecting bot in 5 seconds...")
-                await asyncio.sleep(5)
+                self.logger.info("Reconnecting bot in {} seconds...", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
 
     async def stop(self) -> None:
         """Stop bot and cleanup resources."""
@@ -436,7 +493,7 @@ class QQChannel(BaseChannel):
         file_data: str,
         file_name: str | None = None,
         srv_send_msg: bool = False,
-    ) -> Media:
+    ) -> dict[str, Any]:
         """Upload base64-encoded file and return Media object."""
         if not self._client:
             raise RuntimeError("QQ client not initialized")
@@ -460,39 +517,44 @@ class QQChannel(BaseChannel):
         if file_type != QQ_FILE_TYPE_IMAGE and file_name:
             payload["file_name"] = file_name
 
-        route = Route("POST", endpoint, **{id_key: chat_id})
-        result = await self._client.api._http.request(route, json=payload)
+        route_class = cast(Any, Route)
+        route = route_class("POST", endpoint, **{id_key: chat_id})
+        client = self._client
+        result: object = await client.api._http.request(route, json=payload)
 
         # Extract only the file_info field to avoid extra fields (file_uuid, ttl, etc.)
         # that may confuse QQ client when sending the media object.
         if isinstance(result, dict) and "file_info" in result:
-            return {"file_info": result["file_info"]}
-        return result
+            result_data = cast(dict[str, Any], result)
+            return {"file_info": result_data["file_info"]}
+        return cast(dict[str, Any], result)
 
     # ---------------------------
     # Inbound (receive)
     # ---------------------------
 
-    async def _on_message(self, data: C2CMessage | GroupMessage, is_group: bool = False) -> None:
+    async def _on_message(self, data: object, is_group: bool = False) -> None:
         """Parse inbound message, download attachments, and publish to the bus."""
         try:
+            message = cast(Any, data)
             if is_group:
-                chat_id = data.group_openid
-                user_id = data.author.member_openid
+                chat_id = cast(str, message.group_openid)
+                user_id = cast(str, message.author.member_openid)
                 chat_type = "group"
             else:
                 chat_id = str(
-                    getattr(data.author, "id", None)
-                    or getattr(data.author, "user_openid", "unknown")
+                    getattr(message.author, "id", None)
+                    or getattr(message.author, "user_openid", "unknown")
                 )
                 user_id = chat_id
                 chat_type = "c2c"
 
-            content = (data.content or "").strip()
+            content = str(message.content or "").strip()
 
-            if data.id in self._processed_ids:
+            message_id = cast(str, message.id)
+            if message_id in self._processed_ids:
                 return
-            self._processed_ids.append(data.id)
+            self._processed_ids.append(message_id)
             self._chat_type_cache[chat_id] = chat_type
 
             # Early permission check — avoid attachment downloads and ack side effects
@@ -510,7 +572,10 @@ class QQChannel(BaseChannel):
 
             # the data used by tests don't contain attachments property
             # so we use getattr with a default of [] to avoid AttributeError in tests
-            attachments = getattr(data, "attachments", None) or []
+            attachments = cast(
+                list[object],
+                getattr(message, "attachments", None) or [],
+            )
             media_paths, recv_lines, att_meta = await self._handle_attachments(attachments)
 
             # Compose content that always contains actionable saved paths
@@ -533,7 +598,7 @@ class QQChannel(BaseChannel):
                     await self._send_text_only(
                         chat_id=chat_id,
                         is_group=is_group,
-                        msg_id=data.id,
+                        msg_id=message_id,
                         content=self.config.ack_message,
                     )
                 except Exception:
@@ -545,17 +610,20 @@ class QQChannel(BaseChannel):
                 content=content,
                 media=media_paths if media_paths else None,
                 metadata={
-                    "message_id": data.id,
+                    "message_id": message_id,
                     "attachments": att_meta,
                 },
                 is_dm=not is_group,
             )
         except Exception:
-            self.logger.exception("Error handling inbound message id={}", getattr(data, "id", "?"))
+            self.logger.exception(
+                "Error handling inbound message id={}",
+                getattr(data, "id", "?"),
+            )
 
     async def _handle_attachments(
         self,
-        attachments: list[BaseMessage._Attachments],
+        attachments: list[object],
     ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
         """Extract, download (chunked), and format attachments for agent consumption."""
         media_paths: list[str] = []
@@ -664,9 +732,11 @@ class QQChannel(BaseChannel):
                     1024 * 1024, int(self.config.download_max_bytes or (200 * 1024 * 1024))
                 )
 
-                def _open_tmp():
-                    tmp_path.parent.mkdir(parents=True, exist_ok=True)
-                    return open(tmp_path, "wb")  # noqa: SIM115
+                active_tmp_path = tmp_path
+
+                def _open_tmp() -> BinaryIO:
+                    active_tmp_path.parent.mkdir(parents=True, exist_ok=True)
+                    return active_tmp_path.open("wb")  # noqa: SIM115
 
                 f = await asyncio.to_thread(_open_tmp)
                 try:
@@ -686,7 +756,7 @@ class QQChannel(BaseChannel):
                     await asyncio.to_thread(f.close)
 
                 # Atomic rename
-                await asyncio.to_thread(os.replace, tmp_path, target)
+                await asyncio.to_thread(os.replace, active_tmp_path, target)
                 tmp_path = None  # mark as moved
                 self.logger.info("file saved: {}", str(target))
                 return str(target)
